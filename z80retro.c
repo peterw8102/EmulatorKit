@@ -1,13 +1,15 @@
 /*
- *	https://oshwlab.com/peterw8102/simple-z80
+ *  https://oshwlab.com/peterw8102/simple-z80
+ *  https://github.com/peterw8102/Z80-Retro/wiki
  *
  *	Platform features
  *
  *	Z80 at 14.7MHz
- *	Zilog SIO/2 at 0x80-0x83 at 1/2 clock
+ *  Zilog CTC at 0x40-0x43 at 1/2 clock
+ *	Zilog SIO/2 at 0x80-0x83
  *	Memory banking Zeta style 16K page at 0x60-63
  *	Config port at 64
- *	RTC on I2C
+ *	RTC on bitbang I2C
  *	SD on bitbang SPI
  *
  *	I2C use: 0x64, 0x65 (address bit 0 is clock)
@@ -18,6 +20,8 @@
  *	+ Only the first SDCard is supported
  *	+ Only emulates the main CPU card, not VDU or PIO cards
  *	+ Doesn't simulate programming the Flash
+ *
+ *  Send a SIGHUP to emulate a press of the hardware reset button.
  */
 
 #include <stdio.h>
@@ -33,17 +37,24 @@
 #include <errno.h>
 #include <sys/select.h>
 
+#include "sdcard.h"
 #include "i2c_bitbang.h"
 #include "i2c_ds1307.h"
-#include "sdcard.h"
 #include "system.h"
 #include "libz80/z80.h"
 #include "z80dis.h"
 
+/* Whole available memory space - although only 64 pages exist
+ * in the base system (0-1F: ROM, 20-3F: RAM)
+ */
+enum {
+	READABLE=1,
+	WRITEABLE
+};
 static uint8_t ramrom[256 * 16384];
-
-static unsigned int bankreg[4];
-static uint8_t genio_data;		/* Generic I/O bits */
+static uint8_t pages[256] = {0};   /* 0:not installed, bit 0:readable, bit 1:writeable */
+static uint8_t bankreg[4];
+static uint8_t genio_data;    /* Generic I/O bits */
 
 static uint8_t fast = 0;
 static uint8_t int_recalc = 0;
@@ -52,6 +63,7 @@ static struct sdcard *sdcard;
 
 static struct i2c_bus *i2cbus;		/* I2C bus */
 static struct ds1307 *rtcdev;		/* DS1307 RTC */
+static char  *nvpath = "z80retrom.nvram";
 
 static uint16_t tstate_steps = 730;	/* 14.4MHz speed */
 
@@ -65,6 +77,23 @@ static uint8_t live_irq;
 
 /* Value of the 3 configuration DIP switches */
 static uint8_t dip_switch;
+
+/* Storage for data sent FROM SIO port B */
+static uint8_t blk_out[256] = {0x55, 0xcc};
+static int     blk_out_cnt = 0;
+static int     blk_out_sz  = 0;
+
+/* And data that's queued to be sent. */
+static uint8_t blk_in[256];
+static int     blk_in_cnt = 0;
+static uint8_t blk_size = 0;
+
+/* If there's an open file for transfer to the Z80 system then this is the file descriptor */
+static int blk_fd = -1;
+static int blk_fsize;
+
+/* Files are openned in the blk_path directory */
+static const char *blk_path = NULL;
 
 static Z80Context cpu_z80;
 
@@ -83,24 +112,51 @@ volatile int emulator_done;
 #define TRACE_SD	0x000400
 #define TRACE_I2C	0x000800
 #define TRACE_RTC	0x001000
+#define TRACE_CMD	0x002000
+#define TRACE_INFO	0x000004
 
 static int trace = 0;
 
 static void reti_event(void);
 
-/* TODO : > 3F don't exist */
-static uint8_t *map_addr(uint16_t addr, unsigned is_write)
+static void cpu_state()
 {
+	fprintf(stderr, "[ PC:%04X AF:%02X:%02X BC:%04X DE:%04X HL:%04X IX:%04X IY:%04X SP:%04X ]\n",
+					cpu_z80.M1PC,
+					cpu_z80.R1.br.A, cpu_z80.R1.br.F,
+					cpu_z80.R1.wr.BC, cpu_z80.R1.wr.DE, cpu_z80.R1.wr.HL,
+					cpu_z80.R1.wr.IX, cpu_z80.R1.wr.IY, cpu_z80.R1.wr.SP);
+}
+
+/* Map 16 bit CPU address to a 22 bit physical address */
+static uint8_t *map_addr(uint16_t addr, unsigned is_write) {
 	unsigned int bank = (addr & 0xC000) >> 14;
 	if (!(genio_data & 1)) {
-		if (is_write)
+		/* MMU disabled so ROM everywhere */
+		if (is_write) {
+			if (trace & TRACE_INFO)
+				fprintf(stderr, "[Discarded: ROM] MMU disabled %04x\n",addr);
 			return NULL;
+		}
 		return ramrom + addr;
 	}
-	if (bankreg[bank] < 0x20 && is_write)
+	/* MMU enabled so use bankreg and pstat to determine access */
+	uint8_t pstat = pages[bankreg[bank]];
+	if (!(pstat & WRITEABLE) && is_write) {
+		if (trace & TRACE_INFO) { /* ROM writes go nowhere */
+			fprintf(stderr, "[Discarded: ROM] @%02x:%04x\n", (int)bankreg[bank], (addr & 0x3FFF));
+			cpu_state();
+		}
 		return NULL;
-	return ramrom + 16384 * bankreg[bank] + (addr & 0x3FFF);
+	}
+	else if (!(pstat & READABLE) && (trace & TRACE_INFO)) {
+		fprintf(stderr, "Read from uninstalled memory @%02x:%04x [%02x %02x %02x %02x]\n",
+						(int)bankreg[bank], (addr & 0x3FFF), bankreg[0], bankreg[1], bankreg[2], bankreg[3]);
+		cpu_state();
+	}
+	return ramrom + (bankreg[bank] << 14) + (addr & 0x3FFF);
 }
+
 
 static uint8_t do_mem_read(uint16_t addr, int quiet)
 {
@@ -135,7 +191,7 @@ uint8_t mem_read(int unused, uint16_t addr)
 			return r;
 		}
 		/* Look for ED with M1, followed directly by 4D and if so trigger
-		   the interrupt chain */
+			 the interrupt chain */
 		if (r == 0xED && rstate == 0) {
 			rstate = 1;
 			return r;
@@ -181,14 +237,43 @@ static void z80_trace(unsigned unused)
 	while(nbytes++ < 6)
 		fprintf(stderr, "   ");
 	fprintf(stderr, "%-16s ", buf);
-	fprintf(stderr, "[ %02X:%02X %04X %04X %04X %04X %04X %04X ]\n",
-		cpu_z80.R1.br.A, cpu_z80.R1.br.F,
-		cpu_z80.R1.wr.BC, cpu_z80.R1.wr.DE, cpu_z80.R1.wr.HL,
-		cpu_z80.R1.wr.IX, cpu_z80.R1.wr.IY, cpu_z80.R1.wr.SP);
+  cpu_state();
 }
 
-unsigned int check_chario(void)
-{
+void recalc_interrupts(void) {
+  int_recalc = 1;
+}
+
+/***************** SIO_CLIENT. ***************************/
+/* Three variants - null, console and blk. An instance of
+ * this structure can be connected to either of the SIO ports.
+ */
+typedef struct SIO_CLIENT {
+  uint8_t (*test_chr)(void);
+  uint8_t (*get_chr)(void);
+  void    (*write_chr)(uint8_t chr);
+} SIO_CLIENT;
+
+/***************** Null service *****************/
+/* Use this when an SIO channel is disconnected. Basically a bitbucket */
+static uint8_t null_check(void) {
+  /* Never any characters waiting */
+  return 0;
+}
+static void null_putchr(uint8_t chr) {
+  /* Characters from the Z80 are dumped */
+}
+
+struct SIO_CLIENT null_chan = {
+  null_check,
+  NULL,
+  null_putchr
+};
+
+/***************** Console service *****************/
+/* Used to send/receive data to/from the console */
+
+static uint8_t term_check(void) {
 	fd_set i, o;
 	struct timeval tv;
 	unsigned int r = 0;
@@ -213,26 +298,257 @@ unsigned int check_chario(void)
 	return r;
 }
 
-unsigned int next_char(void)
+static uint8_t term_getchr(void)
 {
 	char c;
 	if (read(0, &c, 1) != 1) {
 		printf("(tty read without ready byte)\n");
 		return 0xFF;
 	}
+  if (trace & TRACE_SIO) {
+    if (c >= 32)
+      fprintf(stderr, "RX: 0x%02x ('%c')\n", (int)c, c);
+    else
+      fprintf(stderr, "RX: 0x%02x\n", (int)c);
+  }
 	if (c == 0x0A)
 		c = '\r';
 	return c;
 }
 
-void recalc_interrupts(void)
-{
-	int_recalc = 1;
+/* Write character to stdout */
+static void term_putchr(uint8_t chr) {
+  write(1, &chr, 1);
 }
 
+struct SIO_CLIENT cons_chan = {
+  term_check,
+  term_getchr,
+  term_putchr
+};
 
+/********************** Block/command protocol emulation  ******************/
+/* To speed development on the real hardware I connect a Raspberry Pi to
+ * SIO port B operating at about 400Kbps. A simple command/response protocol
+ * allows the Z80 code to load files directly from the Pi's file system. The
+ * most common use of this is for the ZLoader to be set to automotically load
+ * 'boot.ihx' at start up and effectively automatically boot into an operational
+ * system. This set of 'blk_' functions implements the basica protocol and
+ * allows this emulator to serve files to the Z80 from the path provided
+ * in the '-b' command line option.
+ *
+ * https://github.com/peterw8102/Z80-Retro/wiki/SIO-Command-Protocol
+ */
+/* blk_check
+ * Check whether there's an available character to send to the Z80.  */
+static uint8_t blk_check(void) {
+  return (blk_out_cnt < blk_out_sz);
+}
 
-struct z80_sio_chan {
+/* blk_getchr
+ * Return the next character ready to be sent to the Z80 and change counters/pointers
+ */
+static uint8_t blk_getchr() {
+  uint8_t c = (blk_out_cnt < blk_out_sz) ?
+                blk_out[blk_out_cnt++]  :
+                0;
+  return c;
+}
+/* blk_show
+ * Dump a command or response buffer
+ */
+static void blk_show(uint8_t *buf, int len) {
+  for (int i = 0; i < len; i++)
+    fprintf(stderr, "%02x ", buf[i]);
+  fprintf(stderr, "\n");
+}
+
+/* blk_error - Send a 6 byte error response to the Z80. */
+static void blk_error(uint8_t code) {
+  blk_out[2]  = blk_in[2]; // Command code
+  blk_out[3]  = code;      // Error code
+  blk_out[4]  = 0;         // No payload.
+  blk_out[5]  = 0;
+  blk_out_sz  = 6;         // Bytes to write
+  blk_out_cnt = 0;         // Current offset
+  if (trace & TRACE_CMD) {
+    fprintf(stderr, "CMD: Tx Response :");
+    blk_show(blk_out, blk_out_sz);
+  }
+}
+
+/* blk_dispatch
+ * There's a complete command in the `blk_in` buffer. Process and make a
+ * response. At the moment ONLY implement command codes 0x10 and 0x11 used
+ * to read files from the slave file system. Leave emulating block storage
+ * devices until another time.
+ */
+static void blk_dispatch() {
+  if (trace & TRACE_CMD) {
+    fprintf(stderr, "CMD: Rx Command: ");
+    blk_show(blk_in, blk_in_cnt);
+  }
+
+  if (blk_in_cnt > 5) {
+    /* There's a body so there's a checksum */
+    uint8_t cs = 0;
+    for (int i = 5; i < blk_in_cnt-1 ; i++)
+      cs += blk_in[i];
+    if (trace & TRACE_CMD)
+      fprintf(stderr, "CMD: Rx checksum: %02x - %s\n", cs, (cs == blk_in[blk_in_cnt - 1]) ? "Ok" : "Bad");
+    if (cs != blk_in[blk_in_cnt-1]) {
+      /* Reject commands with a payload and bad checksum */
+      blk_error(0xff);
+      return;
+    }
+  }
+  blk_out[2] = blk_out[1]; // Copy the command ID into the response
+  char fname[100];
+
+  switch (blk_in[2]) {
+  case 0x10:
+    /* Open a named file for reading */
+    if (blk_in_cnt < 7) {
+      blk_error(0xff);
+      return;
+    }
+    int i, j;
+    for (i = 5, j = 0; i < blk_in_cnt - 1; i++, j++)
+      fname[j] = blk_in[i];
+    fname[j] = 0;
+    if (trace & TRACE_CMD)
+      fprintf(stderr, "CMD: Open File: %s\n", fname);
+
+    // Close any currently open file.
+    if (blk_fd!=-1) {
+      close(blk_fd);
+      blk_fd = -1;
+    }
+    char target[256];
+    strcpy(target, blk_path);
+    strcat(target, "/");
+    strcat(target, fname);
+
+    // Open the new file
+    blk_fd = open(target, O_RDWR);
+
+    if (trace & TRACE_CMD)
+      fprintf(stderr, "CMD: File open \"%s\" : %d - %s\n",
+              target, blk_fd, blk_fd>=0 ? "Ok" : "Failed");
+
+    blk_error(blk_fd<0);
+    blk_fsize = 0;
+    break;
+  case 0x11:
+    /* Read the next 128 bytes from the currently open file */
+    if (blk_fd<0)
+      blk_error(1); // No open file
+
+    // Read next up to 128 bytes into blk_out
+    const int sz = read(blk_fd, (void *)&blk_out[6], 128);
+
+    blk_out[2] = 0x11; // Command ID
+
+    const uint8_t end_of_file = (sz<128);
+
+    blk_out_sz = 6;
+
+    if (sz > 0) {
+      // Checksum...
+      uint8_t *p  = &blk_out[6];
+      uint8_t  cs = 0;
+      for (int i=0;i<sz;i++, p++)
+        cs += *p;
+      *p = cs;
+
+      /* Adjust the number of bytes to transmit */
+      blk_out_sz += sz + 1;
+
+      blk_fsize += sz;
+
+      if (trace & TRACE_CMD)
+          fprintf(stderr, "Checksum: %02x\n", (int)cs);
+    }
+
+    // Add payload length to header.
+    blk_out[3] = end_of_file;       // 1: end of file
+    blk_out[4] = (sz & 0xff);
+    blk_out[5] = 0;                 // Never more than 128 bytes.
+
+    // Send response.
+    if (end_of_file) {
+      /* End of file - close and just return the header. */
+      close(blk_fd);
+      blk_fd = -1;
+      if (trace & TRACE_CMD)
+        fprintf(stderr, "CMD: Sent %d bytes - host file closed\n", blk_fsize);
+    }
+    blk_out_cnt = 0;
+
+    if (trace & TRACE_CMD) {
+      fprintf(stderr, "CMD: Read %d bytes from input file\nCMD: Tx Response :", (int)sz);
+      blk_show(blk_out, blk_out_sz);
+    }
+    break;
+  default:
+    /* unimplemented command - send error. */
+    blk_error(0xff);
+    break;
+  }
+}
+/* blk_putchr
+ * Character sent to US from the Z80. An ad-hoc state machine using
+ * blk_in_cnt looking for the a sequence starting with 0x55, 0xAA.
+ */
+static void blk_putchr(uint8_t chr)
+{
+  blk_in[blk_in_cnt++] = chr;
+
+  if (blk_in_cnt == 1) {
+    /* Ignore everything until a 0x55 sync character */
+    if (chr != 0x55)
+      blk_in_cnt = 0;
+  }
+  else if (blk_in_cnt == 2) {
+    /* 0x55 must be followed by 0xAA */
+    if (chr != 0xAA)
+      blk_in_cnt = 0;
+  }
+  else if (blk_in_cnt == 255) {
+    // Too long. Reset and start again
+    blk_in_cnt = 0;
+  }
+  else if (blk_in_cnt == 5) {
+    /* Have the header - so we know how many more bytes we should expect (body plus checksum) */
+    blk_size = ((blk_in[4] << 8) | blk_in[3]) + 1;
+    if (blk_size == 1) {
+      /* No payload so process what we have */
+      blk_dispatch();
+      blk_in_cnt = 0;
+    }
+    else if (blk_size>128) {
+      /* Although the protocol allows a payload over 128 bytes none
+       * of the currently defined commands use a larger payload so
+       * ignore what we have. */
+      blk_in_cnt = 0;
+    }
+  }
+  else if (blk_in_cnt > 5 && (--blk_size) == 0) {
+    // Header and payload complete
+    blk_dispatch();
+    blk_in_cnt = 0;
+  }
+}
+
+struct SIO_CLIENT blk_chan = {
+  blk_check,
+  blk_getchr,
+  blk_putchr
+};
+
+/********************** SIO Emulation ******************/
+struct z80_sio_chan
+{
 	uint8_t wr[8];
 	uint8_t rr[3];
 	uint8_t data[3];
@@ -246,7 +562,14 @@ struct z80_sio_chan {
 #define INT_ERR	4
 	uint8_t pending;	/* Interrupt bits pending as an IRQ cause */
 	uint8_t vector;		/* Vector pending to deliver */
-};
+	#define SIO_BUSY 1
+	#define SIO_RTS  2 /* Don't change this value - must align with wr[5] */
+	  uint8_t status;  /* Just to help with debug output and tracking state changes */
+	  uint16_t rxchrs; /* Count of received characters */
+
+	  /* What this channel is connected to. Nothing, console, blk protocol etc */
+	  SIO_CLIENT *client;
+	};
 
 static int sio2_input;
 static struct z80_sio_chan sio[2];
@@ -303,7 +626,7 @@ static int sio2_check_im2(struct z80_sio_chan *chan)
 		/* FIXME: move this to other platforms */
 		if (sio[1].wr[1] & 0x04) {
 			/* This is a subset of the real options. FIXME: add
-			   external status change */
+				 external status change */
 			if (sio[1].wr[1] & 0x04) {
 				vector &= 0xF1;
 				if (chan == sio)
@@ -342,22 +665,27 @@ static void sio2_queue(struct z80_sio_chan *chan, uint8_t c)
 		fprintf(stderr, "SIO %d queue %d: ", (int) (chan - sio), c);
 	/* Receive disabled */
 	if (!(chan->wr[3] & 1)) {
-		fprintf(stderr, "RX disabled.\n");
+    if (trace & TRACE_SIO)
+			fprintf(stderr, "RX disabled.\n");
 		return;
 	}
 	/* Overrun */
 	if (chan->dptr == 2) {
-		if (trace & TRACE_SIO)
-			fprintf(stderr, "Overrun.\n");
+    if (trace & TRACE_INFO)
+      fprintf(stderr, "SIO Input Overrun.\n");
 		chan->data[2] = c;
 		chan->rr[1] |= 0x20;	/* Overrun flagged */
 		/* What are the rules for overrun delivery FIXME */
 		sio2_raise_int(chan, INT_ERR);
 	} else {
 		/* FIFO add */
+    chan->rxchrs++;
+
 		if (trace & TRACE_SIO)
 			fprintf(stderr, "Queued %d (mode %d)\n", chan->dptr, chan->wr[1] & 0x18);
 		chan->data[chan->dptr++] = c;
+
+    // Set character available flag (Read Reg 0)
 		chan->rr[0] |= 1;
 		switch (chan->wr[1] & 0x18) {
 		case 0x00:
@@ -377,21 +705,55 @@ static void sio2_queue(struct z80_sio_chan *chan, uint8_t c)
 
 static void sio2_channel_timer(struct z80_sio_chan *chan, uint8_t ab)
 {
-	if (ab == 0) {
-		int c = check_chario();
+  int c = chan->client->test_chr();
 
+  /* Check status */
+  if ((chan->wr[5] ^ chan->status) & SIO_RTS) {
+    /* Change in RTS line status */
+    if (trace & TRACE_SIO)
+      fprintf(stderr, "RTS Change to: %s @%d chars\n", ((chan->wr[5] & 2) ? "Hi" : "Lo"), chan->rxchrs);
+    chan->status ^= SIO_RTS;
+  }
 		if (sio2_input) {
-			if (c & 1)
-				sio2_queue(chan, next_char());
+    /* Read a character IF one is available AND there's room
+     * in the channel input buffer
+     */
+    if (c & 1) {
+      /* There's a character available. Ignore unless:
+        *  - there's room in the channel input buffer (avoid overrun)
+        *  - RTS is active (flow control)
+        */
+      if (chan->dptr < 2) {
+        /* There's room for the input character */
+        if (chan->wr[5] & SIO_RTS) {
+          /* And flow control says not to block it */
+          sio2_queue(chan, chan->client->get_chr());
 		}
+        if (chan->status & SIO_BUSY) {
+          if (trace & TRACE_SIO)
+            fprintf(stderr, "SIO unblocked @%d chars\n", chan->rxchrs);
+
+          /* Clear busy flag */
+          chan->status &= !SIO_BUSY;
+        }
+      }
+      else {
+        /* No space in SIO for this character so block - try again later */
+        if ((trace & TRACE_SIO) && !(chan->status & SIO_BUSY))
+          fprintf(stderr, "SIO full, input blocked @%d chars\n", chan->rxchrs);
+        chan->status |= SIO_BUSY;
+      }
+    }
+  }
 		if (c & 2) {
+    /* Ready to transmit a character */
 			if (!(chan->rr[0] & 0x04)) {
 				chan->rr[0] |= 0x04;
 				if (chan->wr[1] & 0x02)
 					sio2_raise_int(chan, INT_TX);
 			}
 		}
-	} else {
+  if (chan!=sio) {
 		if (!(chan->rr[0] & 0x04)) {
 			chan->rr[0] |= 0x04;
 			if (chan->wr[1] & 0x02)
@@ -400,28 +762,35 @@ static void sio2_channel_timer(struct z80_sio_chan *chan, uint8_t ab)
 	}
 }
 
-static void sio2_timer(void)
-{
+static void sio2_timer(void) {
 	sio2_channel_timer(sio, 0);
 	sio2_channel_timer(sio + 1, 1);
 }
 
-static void sio2_channel_reset(struct z80_sio_chan *chan)
-{
+static void sio2_channel_reset(struct z80_sio_chan *chan) {
 	chan->rr[0] = 0x2C;
 	chan->rr[1] = 0x01;
 	chan->rr[2] = 0;
 	sio2_clear_int(chan, INT_RX | INT_TX | INT_ERR);
 }
 
-static void sio_reset(void)
-{
+static void sio_reset(void) {
 	sio2_channel_reset(sio);
 	sio2_channel_reset(sio + 1);
+
+  /* Channel A (0) connects to the console */
+  sio[0].client = &cons_chan;
+
+  if (blk_path) {
+    /* Only if the -b option specified */
+    sio[1].client  = &blk_chan;
+}
+  else {
+    sio[1].client  = &null_chan;
+  }
 }
 
-static uint8_t sio2_read(uint16_t addr)
-{
+static uint8_t sio2_read(uint16_t addr) {
 	/* Weird mapping */
 	struct z80_sio_chan *chan = (addr & 1) ? sio : sio + 1;
 	if (addr & 2) {
@@ -448,7 +817,8 @@ static uint8_t sio2_read(uint16_t addr)
 			}
 		case 3:
 			/* What does the hw report ?? */
-			fprintf(stderr, "INVALID(0xFF)\n");
+      if (trace & TRACE_INFO)
+				fprintf(stderr, "INVALID(0xFF)\n");
 			return 0xFF;
 		}
 	} else {
@@ -462,8 +832,12 @@ static uint8_t sio2_read(uint16_t addr)
 		sio2_clear_int(chan, INT_RX);
 		chan->rr[0] &= 0x3F;
 		chan->rr[1] &= 0x3F;
-		if (trace & TRACE_SIO)
+    if (trace & TRACE_SIO) {
+      if (c>32 && c<128)
+        fprintf(stderr, "sio%c read data %d (%c)\n", (addr & 2) ? 'b' : 'a', c, c);
+      else
 			fprintf(stderr, "sio%c read data %d\n", (addr & 2) ? 'b' : 'a', c);
+    }
 		if (chan->dptr && (chan->wr[1] & 0x10))
 			sio2_raise_int(chan, INT_RX);
 		return c;
@@ -538,7 +912,7 @@ static void sio2_write(uint16_t addr, uint8_t val)
 		/* Control */
 	} else {
 		/* Strictly we should emulate this as two bytes, one going out and
-		   the visible queue - FIXME */
+			 the visible queue - FIXME */
 		/* FIXME: irq handling */
 		chan->rr[0] &= ~(1 << 2);	/* Transmit buffer no longer empty */
 		chan->txint = 1;
@@ -546,15 +920,10 @@ static void sio2_write(uint16_t addr, uint8_t val)
 		sio2_clear_int(chan, INT_TX);
 		if (trace & TRACE_SIO)
 			fprintf(stderr, "sio%c write data %d\n", (addr & 2) ? 'b' : 'a', val);
-		if (chan == sio)
-			write(1, &val, 1);
-		else {
-//			write(1, "\033[1m;", 5);
-			write(1, &val,1);
-//			write(1, "\033[0m;", 5);
+    if (chan->client->write_chr!=NULL)
+      chan->client->write_chr(val);
 		}
 	}
-}
 
 /*
  *	Z80 CTC
@@ -574,8 +943,8 @@ struct z80_ctc {
 #define CTC_RESET	0x02
 #define CTC_CONTROL	0x01
 	uint8_t irq;		/* Only valid for channel 0, so we know
-				   if we must wait for a RETI before doing
-				   a further interrupt */
+					 if we must wait for a RETI before doing
+					 a further interrupt */
 };
 
 #define CTC_STOPPED(c)	(((c)->ctrl & (CTC_TCONST|CTC_RESET)) == (CTC_TCONST|CTC_RESET))
@@ -620,7 +989,7 @@ static void ctc_reti(int ctcnum)
 }
 
 /* After a RETI or when idle compute the status of the interrupt line and
-   if we are head of the chain this time then raise our interrupt */
+	 if we are head of the chain this time then raise our interrupt */
 
 static int ctc_check_im2(void)
 {
@@ -689,7 +1058,7 @@ static void ctc_tick(unsigned int clocks)
 		if (!(c->ctrl & CTC_PRESCALER))
 			decby <<= 4;
 		/* Now iterate over the events. We need to deal with wraps
-		   because we might have something counters chained */
+			 because we might have something counters chained */
 		n = c->count - decby;
 		while (n < 0) {
 			ctc_interrupt(c);
@@ -718,7 +1087,7 @@ static void ctc_write(uint8_t channel, uint8_t val)
 		c->ctrl &= ~CTC_TCONST|CTC_RESET;
 	} else if (val & CTC_CONTROL) {
 		/* We don't yet model the weirdness around edge wanted
-		   toggling and clock starts */
+			 toggling and clock starts */
 		if (trace & TRACE_CTC)
 			fprintf(stderr, "CTC %d control loaded with %02X\n", channel, val);
 		c->ctrl = val;
@@ -754,6 +1123,7 @@ static uint8_t ctc_read(uint8_t channel)
 	return val;
 }
 
+/******************* Generic I/O - SPI, I2C, memory mapper ***************/
 static uint8_t bitcnt;
 static uint8_t txbits, rxbits;
 static uint8_t genio_txbit;
@@ -786,6 +1156,7 @@ static void genio_write(uint16_t addr, uint8_t val)
 	uint8_t delta = genio_data ^ val;
 	genio_data = val;
 	if (delta & 4) {
+    /* SPI1 (SDCard 1) chip select line */
 		if (genio_data & 4)
 			sd_spi_lower_cs(sdcard);
 		else
@@ -804,10 +1175,12 @@ static void genio_write(uint16_t addr, uint8_t val)
 	}
 }
 
-static uint8_t genio_read(uint16_t addr)
-{
-	unsigned n = (i2c_read(i2cbus) & I2C_DATA) ? 2 : 0;
-	return dip_switch | 0x08 | n | (genio_data & 0x04) | genio_txbit;
+/* genio_read - port 64h input. Show
+ * SDCard 0 as having a card present,
+ * SDCard 1 as absent
+ */
+static uint8_t genio_read(uint16_t addr) {
+  return dip_switch | 0x08 | (i2c_read(i2cbus) << 1) | (genio_data & 0x04) | genio_txbit;
 }
 
 static void spi_write(uint16_t addr, uint8_t val)
@@ -848,10 +1221,10 @@ void io_write(int unused, uint16_t addr, uint8_t val)
 	if (addr >= 0x80 && addr <= 0x87)
 		sio2_write(addr & 3, val);
 	else if (addr >= 0x60 && addr <= 0x63) {
-		bankreg[addr & 3] = val;
 		if (trace & TRACE_BANK)
-			fprintf(stderr, "Bank %d set to %02X [%02X %02X %02X %02X]\n", addr & 3, val,
+      fprintf(stderr, "Bank %d set to %02X before: [%02X %02X %02X %02X]\n", addr & 3, val,
 				bankreg[0], bankreg[1], bankreg[2], bankreg[3]);
+    bankreg[addr & 3] = val;
 	}
 	else if (addr >= 0x40 && addr <= 0x43)
 		ctc_write(addr & 3, val);
@@ -871,11 +1244,17 @@ void io_write(int unused, uint16_t addr, uint8_t val)
 		fprintf(stderr, "Unknown write to port %04X of %02X\n", addr, val);
 }
 
+/* Change any generic I/O registers that are affected by a reset */
+void io_reset() {
+  bankreg[0]  =  bankreg[1] = bankreg[2] = bankreg[3] = 0;
+  genio_data &= ~1;   /* MMU off */
+}
+
 static void poll_irq_event(void)
 {
 	if (!live_irq)
 		if (!sio2_check_im2(sio))
-		        if (!sio2_check_im2(sio + 1))
+						if (!sio2_check_im2(sio + 1))
 				ctc_check_im2();
 	/* TODO: PIO */
 }
@@ -906,6 +1285,12 @@ static struct termios saved_term, term;
 
 static void cleanup(int sig)
 {
+  if (nvpath!=NULL)
+    rtc_save(rtcdev, nvpath);
+
+  if (sdcard!=NULL)
+		sd_detach(sdcard);
+
 	tcsetattr(0, TCSADRAIN, &saved_term);
 	emulator_done = 1;
 }
@@ -921,16 +1306,102 @@ static void usage(void)
 		"z80retro: [-b cpath] [-c config] [-r rompath] [-S sdpath] [-N nvpath] [-f] [-d debug]\n"
 			"   config:  State of DIP switches (0-7)\n"
 			"   rompath: 512K binary file\n"
+      "   cpath:   Path to directory holding files to serve over SIO port B\n"
 			"   sdpath:  Path to file containing SDCard data\n"
 			"   debug:   Comma separated list of: MEM,IO,INFO,UNK,CPU,BANK,SIO,CTC,IRQ,SPI,SD,I2C,RTC\n"
 			"   nvpath:  file to store DS1307+ RTC non-volatile memory\n"
-			);			
-	exit(EXIT_FAILURE);
-	/*
-		"   cpath:   Path to directory holding files to serve over SIO port B\n"
 		"If -b is specified then the emulator runs a file server function allowing the\n"
-		"Z80 to download files directly from the host computer."
-	*/
+          "Z80 to download files directly from the host computer.");
+  exit(EXIT_FAILURE);
+}
+
+
+/**/
+static const char *tokens[] =
+  {"MEM", "IO", "ROM", "UNK", "CPU", "BANK", "SIO", "CTC", "IRQ", "SPI", "SD", "I2C", "RTC", "CMD", "INFO", NULL};
+
+static void trace_on(const char *token)
+{
+  uint16_t code=1; //, cnt=0;
+  const char **tptr = tokens;
+  while (*tptr!=NULL) {
+    if (strcasecmp(token, *tptr)==0) {
+      trace |= code;
+      return;
+    }
+    tptr++;
+    code <<= 1;
+  }
+}
+
+/* parse_trace
+ * Parse the value of provided with the -d run time option. This
+ * is either a number or a string. If a number then it's decimal
+ * and is used to set the literal value of the trace register. If
+ * it's a string then treat it as a comma separated list and break
+ * into tokens. Each token is the name of a trace flag to switch
+ * on.
+ * */
+static void parse_trace(const char *str)
+{
+
+  /* If str looks like a number then literal trace value */
+  if (str[0]>='0' && str[1]<='9') {
+    trace = atoi(str);
+    return;
+  }
+
+  char *args = strdup(str);
+  char *toklst, *token;
+
+  fprintf(stderr, "Trace flags: %s\n", args);
+  if (args==NULL) {
+    fprintf(stderr, "Out of memory\n");
+    exit(EXIT_FAILURE);
+  }
+  toklst = args;
+  while ((token = strsep(&toklst,","))!=NULL)
+    trace_on(token);
+
+  free(args);
+}
+
+/* make_sd
+ * Only used for SDCard 0 but could be called a second time to
+ * emulate the second SDCard. This would only require a little
+ * logic in the genio area to direct calls to the right card.
+ */
+static struct sdcard *make_sd(const char *name, const char *path)
+{
+struct sdcard *card = sd_create(name);
+int fd;
+
+	if (path) {
+		fd = open(path, O_RDWR);
+		if (fd == -1) {
+			perror(path);
+			exit(1);
+		}
+		sd_attach(card, fd);
+	}
+
+	sd_trace(card, (trace & TRACE_SD) != 0);
+
+	return card;
+}
+
+/* sys_reset
+ * Simulates the hardware reset button being pressed. Called
+ * when the emulator receives a HUP signal. Note that i2c/SPI
+ * devices aren't connected to the reset line so aren't reset.
+ */
+static void sys_reset()
+{
+  fprintf(stderr, "Hardware RESET\n");
+  Z80RESET(&cpu_z80);
+  io_reset();
+  sio_reset();
+  ctc_init();
 }
 
 int main(int argc, char *argv[])
@@ -942,20 +1413,23 @@ int main(int argc, char *argv[])
 	char *nvpath = "z80retrom.nvram";
 	char *sdpath = NULL;
 
-	while ((opt = getopt(argc, argv, "d:fr:S:")) != -1) {
+  while ((opt = getopt(argc, argv, "b:c:d:fr:S:N:")) != -1) {
 		switch (opt) {
+    case 'b':
+      blk_path = optarg;
+      break;
 		case 'r':
 			rompath = optarg;
 			break;
 		case 'S':
 			sdpath = optarg;
 			break;
-		case 'd':
-			trace = atoi(optarg);
-			break;
 		case 'N':
 			nvpath = optarg;
 			break;
+    case 'd':
+      parse_trace(optarg);
+      break;
 		case 'c':
 			/* State of the 3 DIP switches used for configuration,
 			 * shifted to the right place in  */
@@ -971,28 +1445,27 @@ int main(int argc, char *argv[])
 	if (optind < argc)
 		usage();
 
+  /* Identify read/write pages */
+  for (int p=0x20;p<0x40;p++)
+    pages[p] = READABLE | WRITEABLE;
+
+  /* And read only (flash) pages */
+  for (int p=0;p<0x20;p++)
+    pages[p] = READABLE;
+
 	fd = open(rompath, O_RDONLY);
 	if (fd == -1) {
 		perror(rompath);
 		exit(EXIT_FAILURE);
 	}
+
 	if (read(fd, &ramrom[0], 524288) != 524288) {
 		fprintf(stderr, "z80retro: banked rom image should be 512K.\n");
 		exit(EXIT_FAILURE);
 	}
 	close(fd);
 
-	sdcard = sd_create("sd0");
-	if (sdpath) {
-		fd = open(sdpath, O_RDWR);
-		if (fd == -1) {
-			perror(sdpath);
-			exit(1);
-		}
-		sd_attach(sdcard, fd);
-	}
-	if (trace & TRACE_SD)
-		sd_trace(sdcard, 1);
+	sdcard = make_sd("sd0", sdpath);
 
 	i2cbus = i2c_create();
 	i2c_trace(i2cbus, (trace & TRACE_I2C) != 0);
@@ -1006,7 +1479,7 @@ int main(int argc, char *argv[])
 	sio2_input = 1;
 
 	/* 2.5ms - it's a balance between nice behaviour and simulation
-	   smoothness */
+		 smoothness */
 	tc.tv_sec = 0;
 	tc.tv_nsec = 20000000L;
 
@@ -1014,8 +1487,10 @@ int main(int argc, char *argv[])
 		saved_term = term;
 		atexit(exit_cleanup);
 		signal(SIGINT, cleanup);
+    signal(SIGTERM, cleanup);
 		signal(SIGQUIT, cleanup);
 		signal(SIGPIPE, cleanup);
+    signal(SIGHUP, sys_reset);
 		term.c_lflag &= ~(ICANON | ECHO);
 		term.c_cc[VMIN] = 0;
 		term.c_cc[VTIME] = 1;
@@ -1033,18 +1508,18 @@ int main(int argc, char *argv[])
 	cpu_z80.trace = z80_trace;
 
 	/* This is the wrong way to do it but it's easier for the moment. We
-	   should track how much real time has occurred and try to keep cycle
-	   matched with that. The scheme here works fine except when the host
-	   is loaded though */
+		 should track how much real time has occurred and try to keep cycle
+		 matched with that. The scheme here works fine except when the host
+		 is loaded though */
 
 	/* We run 7372000 t-states per second */
 	/* We run 365 cycles per I/O check, do that 50 times then poll the
-	   slow stuff and nap for 20ms to get 50Hz on the TMS99xx */
+		 slow stuff and nap for 20ms to get 50Hz on the TMS99xx */
 	while (!emulator_done) {
 		if (cpu_z80.halted && ! cpu_z80.IFF1) {
 			/* HALT with interrupts disabled, so nothing left
-			   to do, so exit simulation. If NMI was supported,
-			   this might have to change. */
+				 to do, so exit simulation. If NMI was supported,
+				 this might have to change. */
 			emulator_done = 1;
 			break;
 		}
@@ -1065,13 +1540,13 @@ int main(int argc, char *argv[])
 			nanosleep(&tc, NULL);
 		if (int_recalc) {
 			/* If there is no pending Z80 vector IRQ but we think
-			   there now might be one we use the same logic as for
-			   reti */
+				 there now might be one we use the same logic as for
+				 reti */
 			if (!live_irq)
 				poll_irq_event();
 			/* Clear this after because reti_event may set the
-			   flags to indicate there is more happening. We will
-			   pick up the next state changes on the reti if so */
+				 flags to indicate there is more happening. We will
+				 pick up the next state changes on the reti if so */
 			if (!(cpu_z80.IFF1|cpu_z80.IFF2))
 				int_recalc = 0;
 		}
